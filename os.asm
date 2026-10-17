@@ -10861,6 +10861,11 @@ process_detach_thread:
     ret
 
 preemptive_scheduler_test:
+    pushfq
+    pop rax
+    shr rax, 9
+    and al, 1
+    mov [preempt_test_saved_if], al
     push r12
     push r13
     push r14
@@ -10907,9 +10912,12 @@ preemptive_scheduler_test:
     mov rax, [lapic_virt_base]
     test rax, rax
     jz .fail_stage_timer_not_started
+    mov rax, [lapic_virt_base]
     mov eax, dword [rax + LAPIC_TIMER_CUR]
     mov [preempt_test_lapic_cur_before], rax
-    mov eax, dword [rax + LAPIC_LVT_TIMER]
+
+    mov rdx, [lapic_virt_base]
+    mov eax, dword [rdx + LAPIC_LVT_TIMER]
     mov [preempt_test_lapic_lvt_before], rax
 
     lea rdi, [preempt_test_worker]
@@ -11009,6 +11017,12 @@ preemptive_scheduler_test:
     pop r14
     pop r13
     pop r12
+    cmp byte [preempt_test_saved_if], 1
+    jne .success_if_off
+    sti
+    ret
+.success_if_off:
+    cli
     ret
 
 .fail_stage_timer_not_ready:
@@ -14554,6 +14568,8 @@ scheduler_test_force_preempt:
 align 8
 preempt_test_lapic_cur_before:
     dq 0
+preempt_test_saved_if:
+    db 0
 preempt_test_timer_before:
     dq 0
 preempt_test_lapic_lvt_before:
