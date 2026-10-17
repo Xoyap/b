@@ -10873,6 +10873,13 @@ preemptive_scheduler_test:
 
     call scheduler_disable_preemption
 
+    call kheap_init
+    test eax, eax
+    jz .heap_ready
+    mov qword [preempt_test_fail_stage], 17
+    jmp .fail
+.heap_ready:
+
     ; This test is meaningful only when the LAPIC timer is actually running.
     ; Do not silently accept a scheduler with no interrupt source.
     cmp byte [lapic_timer_ready], 1
