@@ -227,7 +227,8 @@ global _e
 %define TH_SLICE_TICKS           200
 %define TH_RUNTIME_TICKS         208
 %define TH_PREEMPT_COUNT         216
-%define TH_SIZE                  224
+%define TH_WAKE_TICK             224
+%define TH_SIZE                  232
 
 %define PREEMPT_GPR_BYTES        120
 %define PREEMPT_FRAME_BYTES      160
@@ -10164,7 +10165,40 @@ scheduler_enable_preemption:
 scheduler_disable_preemption:
     mov qword [preemptive_scheduler_enabled], 0
     ret
+; Wake blocked threads whose deadline has expired.
+scheduler_wake_sleepers:
+    push r12
+    push r13
 
+    mov r12, [all_thread_head]
+
+.scan:
+    test r12, r12
+    jz .done
+
+    mov r13, [r12 + TH_ALL_NEXT]
+
+    cmp qword [r12 + TH_STATE], THREAD_STATE_BLOCKED
+    jne .next
+
+    mov rax, [r12 + TH_WAKE_TICK]
+    cmp rax, [scheduler_tick_count]
+    ja .next
+
+    mov qword [r12 + TH_WAKE_TICK], 0
+    mov qword [r12 + TH_STATE], THREAD_STATE_READY
+
+    mov rdi, r12
+    call ready_enqueue
+
+.next:
+    mov r12, r13
+    jmp .scan
+
+.done:
+    pop r13
+    pop r12
+    ret
 ; RDI = saved-GPR frame address. Returns RAX = frame to restore.
 scheduler_timer_tick:
     push rbx
@@ -10176,6 +10210,7 @@ scheduler_timer_tick:
     mov qword [scheduler_in_irq], 1
     inc qword [scheduler_tick_count]
     inc qword [scheduler_irq_entries]
+    call scheduler_wake_sleepers
 
     cmp qword [preemptive_scheduler_enabled], 1
     jne .same_disabled
@@ -10383,7 +10418,95 @@ scheduler_yield:
 .halt:
     hlt
     jmp .halt
+; thread_sleep(RDI = number of timer ticks)
+; EAX = 0 success, 1 unsupported/error
+thread_sleep:
+    push rbx
+    push r12
+    push r13
+    push r14
+    sub rsp, 8
 
+    mov rbx, rdi
+
+    test rbx, rbx
+    jz .yield
+
+    cmp qword [preemptive_scheduler_enabled], 1
+    je .fail
+
+    mov r12, [current_thread]
+    test r12, r12
+    jz .fail
+
+    cmp qword [r12 + TH_MAGIC], THREAD_MAGIC
+    jne .fail
+
+    cmp qword [r12 + TH_STATE], THREAD_STATE_RUNNING
+    jne .fail
+
+    cmp r12, [scheduler_return_thread]
+    je .fail
+
+    pushfq
+    pop r14
+    cli
+
+    mov rax, [scheduler_tick_count]
+    add rax, rbx
+    mov [r12 + TH_WAKE_TICK], rax
+    mov qword [r12 + TH_STATE], THREAD_STATE_BLOCKED
+
+    call scheduler_pick_next
+    test rax, rax
+    jz .restore
+
+    cmp rax, r12
+    je .restore
+
+    mov r13, rax
+    mov qword [r13 + TH_STATE], THREAD_STATE_RUNNING
+    mov [current_thread], r13
+    or qword [r13 + TH_CTX + CTX_RFLAGS], 0x200
+
+    lea rdi, [r12 + TH_CTX]
+    lea rsi, [r13 + TH_CTX]
+    call context_switch
+
+    test r14, 0x200
+    jz .if_off
+    sti
+    xor eax, eax
+    jmp .done
+
+.if_off:
+    cli
+    xor eax, eax
+    jmp .done
+
+.restore:
+    mov qword [r12 + TH_WAKE_TICK], 0
+    mov qword [r12 + TH_STATE], THREAD_STATE_RUNNING
+    mov [current_thread], r12
+    test r14, 0x200
+    jz .fail
+    sti
+
+.fail:
+    mov eax, 1
+    jmp .done
+
+.yield:
+    call scheduler_yield
+    xor eax, eax
+
+.done:
+    add rsp, 8
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
 ; Current thread has returned from its entry point. Never returns.
 scheduler_thread_exit:
     ; A returning preemptive worker must become DEAD atomically with respect to
