@@ -173,15 +173,18 @@ global _e
 
 %define CMD_MAX 64
 
-; --- 0xDEAD OS desktop palette ---
-%define UI_BG       0x000E0D0A
-%define UI_TOP      0x001C1913
-%define UI_SIDE     0x0013100D
-%define UI_PANEL    0x0016120E
-%define UI_ACCENT   0x00D69A36
-%define UI_ACCENT2  0x004F7A62
-%define UI_TEXT     0x00E6E0D2
-%define UI_MUTED    0x008A857A
+
+%define START_Y                60
+
+; 0xDEAD OS — Gothic Alternative
+%define UI_BG       0x000D0A10
+%define UI_TOP      0x0017101B
+%define UI_SIDE     0x000D0A10
+%define UI_PANEL    0x000D0A10
+%define UI_ACCENT   0x008B2948
+%define UI_ACCENT2  0x008B2948
+%define UI_TEXT     0x00E6DCE8
+%define UI_MUTED    0x00917D96
 
 ;================ CONTEXT SWITCH / THREAD FOUNDATION =================
 %define CTX_RSP      0
@@ -515,8 +518,8 @@ console_clear:
     ret
 
 console_scroll:
-    call cursor_erase
-
+    pushfq
+    cli
     push rsi
     push rdi
     push rcx
@@ -526,40 +529,41 @@ console_scroll:
     cld
 
     mov rdi, [video + Video.fb]
-    mov rax, [video + Video.h]
-    cmp rax, CHAR_H
-    jbe .done
-
     mov rax, [video + Video.sl]
-    imul rax, CHAR_H
-    lea rsi, [rdi + rax * 4]
-
-    mov rax, [video + Video.sl]
-    mov rcx, [video + Video.h]
-    sub rcx, CHAR_H
-    imul rax, rcx
-    mov rcx, rax
-    rep movsd
-
-    mov rdi, [video + Video.fb]
-    mov rax, [video + Video.sl]
-    mov rcx, [video + Video.h]
-    sub rcx, CHAR_H
-    imul rax, rcx
+    imul rax, START_Y
     lea rdi, [rdi + rax * 4]
 
-    mov rax, [video + Video.sl]
-    imul rax, CHAR_H
-    mov rcx, rax
+    mov rsi, [video + Video.sl]
+    imul rsi, CHAR_H
+    lea rsi, [rdi + rsi * 4]
+
+    mov rax, [video + Video.h]
+    sub rax, START_Y
+    sub rax, CHAR_H
+    jbe .clear
+
+    mov rcx, [video + Video.sl]
+    imul rcx, rax
+    rep movsd
+
+.clear:
+    mov rdi, [video + Video.fb]
+    mov rax, [video + Video.h]
+    sub rax, CHAR_H
+    imul rax, [video + Video.sl]
+    lea rdi, [rdi + rax * 4]
+
+    mov rcx, [video + Video.sl]
+    imul rcx, CHAR_H
     mov eax, [video + Video.bg]
     rep stosd
 
-.done:
     pop rdx
     pop rax
     pop rcx
     pop rdi
     pop rsi
+    popfq
     ret
 
 console_putc:
@@ -683,24 +687,15 @@ draw_text:
     ret
 
 ;================ DESKTOP DRAW =================
+
 desktop_draw:
-    push rbx
     push r12
-    push r13
-    push r14
-    push r15
     sub rsp, 32
 
-    ; Keep the existing console readable and inside the main panel.
-    cmp qword [video + Video.w], 640
-    jb .done
-    cmp qword [video + Video.h], 400
-    jb .done
-
     mov qword [video + Video.fg], UI_TEXT
-    mov qword [video + Video.bg], UI_PANEL
+    mov qword [video + Video.bg], UI_BG
 
-    ; Full-screen background
+    ; Clear the screen with the base color.
     xor ecx, ecx
     xor edx, edx
     mov r8, [video + Video.w]
@@ -708,7 +703,7 @@ desktop_draw:
     mov r10d, UI_BG
     call fill_rect
 
-    ; Top bar
+    ; Minimal top bar.
     xor ecx, ecx
     xor edx, edx
     mov r8, [video + Video.w]
@@ -716,7 +711,7 @@ desktop_draw:
     mov r10d, UI_TOP
     call fill_rect
 
-    ; Accent line below the top bar
+    ; Single-color accent line.
     xor ecx, ecx
     mov edx, 47
     mov r8, [video + Video.w]
@@ -724,98 +719,24 @@ desktop_draw:
     mov r10d, UI_ACCENT
     call fill_rect
 
-    ; Left navigation rail
-    xor ecx, ecx
-    mov edx, 48
-    mov r8d, 64
-    mov r9, [video + Video.h]
-    sub r9, 48
-    mov r10d, UI_SIDE
-    call fill_rect
-
-    ; Main terminal panel
-    mov ecx, 88
-    mov edx, 80
-    mov r8d, 640
-    mov r9d, 420
-    mov r10d, UI_PANEL
-    call fill_rect
-
-    ; Accent strip on the panel
-    mov ecx, 88
-    mov edx, 80
-    mov r8d, 4
-    mov r9d, 420
-    mov r10d, UI_ACCENT
-    call fill_rect
-
-    ; Header label
+    ; OS title.
     mov ecx, 24
     mov edx, 18
-    mov r8d, UI_TEXT
+    mov r8d, UI_ACCENT
     lea r9, [ui_title]
     call desktop_text_at
 
-    ; Top-right status
+    ; Status text.
     mov ecx, 160
     mov edx, 18
-    mov r8d, UI_MUTED
+    mov r8d, UI_TEXT
     lea r9, [ui_status]
     call desktop_text_at
 
-    ; Panel title
-    mov ecx, 112
-    mov edx, 92
-    mov r8d, UI_ACCENT
-    lea r9, [ui_terminal]
-    call desktop_text_at
-
-    ; Footer
-    mov ecx, 112
-    mov edx, 474
-    mov r8d, UI_MUTED
-    lea r9, [ui_footer]
-    call desktop_text_at
-
-    ; Decorative navigation marks
-    mov ecx, 24
-    mov edx, 82
-    mov r8d, 16
-    mov r9d, 3
-    mov r10d, UI_ACCENT
-    call fill_rect
-
-    mov ecx, 24
-    mov edx, 112
-    mov r8d, 16
-    mov r9d, 3
-    mov r10d, UI_ACCENT2
-    call fill_rect
-
-    mov ecx, 24
-    mov edx, 142
-    mov r8d, 16
-    mov r9d, 3
-    mov r10d, UI_ACCENT2
-    call fill_rect
-
-.done:
     add rsp, 32
-    pop r15
-    pop r14
-    pop r13
     pop r12
-    pop rbx
     ret
 
-
-; Inputs:
-;   RCX = X
-;   RDX = Y
-;   R8D = text color
-;   R9  = null-terminated string
-;
-; Draw directly; do not change the console cursor.
 desktop_text_at:
     push r12
     push r13
@@ -885,8 +806,8 @@ newline:
 
 ensure_y:
     mov rax, [video + Video.h]
-    cmp rax, CHAR_H
-    jbe .zero
+    cmp rax, START_Y + CHAR_H
+    jbe .done
 
     mov rax, [video + Video.cy]
     add rax, CHAR_H
@@ -894,15 +815,9 @@ ensure_y:
     jbe .done
 
     call console_scroll
-
     mov rax, [video + Video.h]
     sub rax, CHAR_H
     mov [video + Video.cy], rax
-    ret
-
-.zero:
-    mov qword [video + Video.cy], 0
-
 .done:
     ret
 
@@ -12705,6 +12620,7 @@ kernel_entry:
     lea rsi, [s_kern_console]
     call serial_puts
     call console_clear
+    call desktop_draw
 
     jmp .kernel_console_ready
 
@@ -13414,9 +13330,9 @@ fail_code:
 section .data
 
 ui_title:    db "0xDEAD OS", 0
-ui_status:   db "UEFI / X86-64", 0
+ui_status:   db "NATIVE KERNEL  |  x86-64", 0
 ui_terminal: db "KERNEL CONSOLE", 0
-ui_footer:   db "0xDEAD / DEBUG BUILD", 0
+ui_footer:   db "UEFI -> NATIVE KERNEL", 0
 
 align 16
 guid:
@@ -14471,12 +14387,12 @@ ps2_scancode_table:
     db 0, 0, 0, 0, 0, 0, 0, '7', '8', '9', '-', '4', '5', '6', '+', '1'
     db '2', '3', '0', '.', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 
+
 msg_kernel_banner:
-    db "===============================================================",10
-    db "                     0xDEAD OPERATING SYSTEM",10
-    db "                         KERNEL MODE",10,10
-    db "---------------------------------------------------------------",10,10
-    db "                    KERNEL INITIALIZING",10,10,0
+    db "NATIVE KERNEL",10
+    db "Architecture : x86-64",10
+    db "Boot mode    : UEFI -> KERNEL",10,10
+    db "Initializing core subsystems...",10,10,0
 
 font_table:
     db 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
