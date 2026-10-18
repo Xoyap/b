@@ -8178,11 +8178,7 @@ kernel_diagnostic:
     lea rsi, [thread_sleep_test]
     lea rdx, [reason_diag2_sleep]
     call diag_run_one
-
-    lea rdi, [str_diag2_sleep]
-    lea rsi, [thread_sleep_test]
-    lea rdx, [reason_diag2_sleep]
-    call diag_run_one
+    
     ; Keep IF=0 during preemptive-scheduler setup.  thread_bootstrap enables
     ; interrupts only after scheduler_start has saved the shell context.
     lea rdi, [str_diag2_preempt]
@@ -11673,151 +11669,7 @@ scheduler_test_worker:
     cmp qword [r14], SCHED_TEST_ROUNDS
     jb .loop
     ret
-;---------------- Real thread_sleep integration test ----------------
-thread_sleep_test:
-    push r12
-    push r13
-    push r14
-    push r15
-    sub rsp, 8
 
-    call scheduler_disable_preemption
-
-    lea rdi, [scheduler_test_main]
-    call scheduler_main_init
-    test eax, eax
-    jnz .fail
-
-    mov qword [sleep_test_stage], 0
-    mov qword [sleep_test_result], 1
-    mov qword [sleep_test_start], 0
-    mov qword [sleep_test_end], 0
-    mov qword [sleep_test_threads], 0
-    mov qword [sleep_test_threads + 8], 0
-
-    lea rdi, [sleep_test_sleeper]
-    xor esi, esi
-    call thread_create
-    test rax, rax
-    jz .fail
-    mov [sleep_test_threads], rax
-
-    lea rdi, [sleep_test_helper]
-    xor esi, esi
-    call thread_create
-    test rax, rax
-    jz .cleanup_first
-    mov [sleep_test_threads + 8], rax
-
-    ; Start the cooperative scheduler.
-    call scheduler_start
-
-    cmp qword [sleep_test_stage], 2
-    jne .cleanup
-    cmp qword [sleep_test_result], 0
-    jne .cleanup
-
-    mov rax, [sleep_test_end]
-    sub rax, [sleep_test_start]
-    cmp rax, 3
-    jb .cleanup
-
-    cmp qword [ready_count], 0
-    jne .cleanup
-    cmp qword [all_thread_count], 2
-    jne .cleanup
-
-    mov rdi, [sleep_test_threads]
-    call thread_destroy
-    test eax, eax
-    jnz .fail
-
-    mov rdi, [sleep_test_threads + 8]
-    call thread_destroy
-    test eax, eax
-    jnz .fail
-
-    cmp qword [all_thread_count], 0
-    jne .fail
-
-    xor eax, eax
-    jmp .done
-
-.cleanup:
-    ; If the sleeper timed out or failed, make it removable from the queue.
-    mov r12, [sleep_test_threads]
-    test r12, r12
-    jz .cleanup_helper
-
-    cmp qword [r12 + TH_STATE], THREAD_STATE_BLOCKED
-    jne .cleanup_first_thread
-
-    mov qword [r12 + TH_WAKE_TICK], 0
-    mov qword [r12 + TH_STATE], THREAD_STATE_READY
-    mov rdi, r12
-    call ready_enqueue
-
-.cleanup_first_thread:
-    mov rdi, [sleep_test_threads]
-    test rdi, rdi
-    jz .cleanup_helper
-    call thread_destroy
-
-.cleanup_helper:
-    mov rdi, [sleep_test_threads + 8]
-    test rdi, rdi
-    jz .fail
-    call thread_destroy
-    jmp .fail
-
-.cleanup_first:
-    mov rdi, [sleep_test_threads]
-    call thread_destroy
-
-.fail:
-    mov eax, 1
-
-.done:
-    add rsp, 8
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    ret
-
-sleep_test_sleeper:
-    mov qword [sleep_test_stage], 1
-    mov rax, [scheduler_tick_count]
-    mov [sleep_test_start], rax
-
-    mov edi, 3
-    call thread_sleep
-    mov [sleep_test_result], rax
-
-    mov rax, [scheduler_tick_count]
-    mov [sleep_test_end], rax
-    mov qword [sleep_test_stage], 2
-    ret
-
-sleep_test_helper:
-    xor r12d, r12d
-
-.loop:
-    cmp qword [sleep_test_stage], 2
-    jae .done
-
-    inc r12
-    cmp r12, 100000000
-    jae .timeout
-
-    call scheduler_yield
-    jmp .loop
-
-.timeout:
-    mov qword [sleep_test_stage], 3
-
-.done:
-    ret
 ;---------------- Compatibility lifecycle test ----------------
 thread_lifecycle_test:
     push r12
@@ -11862,6 +11714,125 @@ thread_lifecycle_test:
 
 thread_test_entry:
     mov qword [thread_test_entered], 1
+    ret
+
+;---------------- Thread sleep / wakeup test ----------------
+thread_sleep_test:
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+
+    call scheduler_disable_preemption
+
+    lea rdi, [scheduler_test_main]
+    call scheduler_main_init
+    test eax, eax
+    jnz .fail
+
+    mov r15, [scheduler_tick_count]
+
+    lea rdi, [thread_sleep_test_entry]
+    xor esi, esi
+    call thread_create
+    test rax, rax
+    jz .fail_restore
+
+    mov r12, rax
+
+    ; Remove the new thread from READY before simulating sleep.
+    mov rdi, r12
+    call ready_remove
+    test eax, eax
+    jnz .fail_cleanup
+
+    mov qword [r12 + TH_STATE], THREAD_STATE_BLOCKED
+    lea rax, [r15 + 3]
+    mov [r12 + TH_WAKE_TICK], rax
+
+    ; Before deadline: must remain BLOCKED.
+    mov [scheduler_tick_count], r15
+    call scheduler_wake_sleepers
+    cmp qword [r12 + TH_STATE], THREAD_STATE_BLOCKED
+    jne .fail_cleanup
+    cmp qword [ready_count], 0
+    jne .fail_cleanup
+
+    ; One tick before deadline: still BLOCKED.
+    lea rax, [r15 + 2]
+    mov [scheduler_tick_count], rax
+    call scheduler_wake_sleepers
+    cmp qword [r12 + TH_STATE], THREAD_STATE_BLOCKED
+    jne .fail_cleanup
+    cmp qword [ready_count], 0
+    jne .fail_cleanup
+
+    ; At deadline: transition to READY exactly once.
+    lea rax, [r15 + 3]
+    mov [scheduler_tick_count], rax
+    call scheduler_wake_sleepers
+
+    cmp qword [r12 + TH_STATE], THREAD_STATE_READY
+    jne .fail_cleanup
+    cmp qword [r12 + TH_WAKE_TICK], 0
+    jne .fail_cleanup
+    cmp qword [ready_count], 1
+    jne .fail_cleanup
+    cmp qword [ready_head], r12
+    jne .fail_cleanup
+    cmp qword [ready_tail], r12
+    jne .fail_cleanup
+
+    ; Repeated wakeup must not enqueue the same thread twice.
+    call scheduler_wake_sleepers
+    cmp qword [ready_count], 1
+    jne .fail_cleanup
+
+    mov rdi, r12
+    call thread_destroy
+    test eax, eax
+    jnz .fail_restore
+
+    cmp qword [ready_count], 0
+    jne .fail_restore
+    cmp qword [all_thread_count], 0
+    jne .fail_restore
+
+    mov [scheduler_tick_count], r15
+    lea r9, [msg_sleep_test_ok]
+    call draw_text
+    xor eax, eax
+    jmp .done
+
+.fail_cleanup:
+    ; Restore a valid queue state so cleanup can safely destroy the thread.
+    cmp qword [r12 + TH_STATE], THREAD_STATE_BLOCKED
+    jne .destroy
+    mov qword [r12 + TH_STATE], THREAD_STATE_READY
+    mov qword [r12 + TH_WAKE_TICK], 0
+    cmp qword [ready_count], 0
+    jne .destroy
+    mov rdi, r12
+    call ready_enqueue
+
+.destroy:
+    mov rdi, r12
+    call thread_destroy
+
+.fail_restore:
+    mov [scheduler_tick_count], r15
+.fail:
+    lea r9, [msg_sleep_test_fail]
+    call draw_text
+    mov eax, 1
+
+.done:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
     ret
 
 thread_sleep_test_entry:
@@ -15412,13 +15383,3 @@ pmm_bitmap:
 align 16
 buddy_static_pool:
     times (2 * BUDDY_STATIC_BLOCK_SIZE) db 0
-sleep_test_threads:
-    times 2 dq 0
-sleep_test_stage:
-    dq 0
-sleep_test_result:
-    dq 1
-sleep_test_start:
-    dq 0
-sleep_test_end:
-    dq 0
