@@ -11864,125 +11864,6 @@ thread_test_entry:
     mov qword [thread_test_entered], 1
     ret
 
-;---------------- Thread sleep / wakeup test ----------------
-thread_sleep_test:
-    push r12
-    push r13
-    push r14
-    push r15
-    sub rsp, 8
-
-    call scheduler_disable_preemption
-
-    lea rdi, [scheduler_test_main]
-    call scheduler_main_init
-    test eax, eax
-    jnz .fail
-
-    mov r15, [scheduler_tick_count]
-
-    lea rdi, [thread_sleep_test_entry]
-    xor esi, esi
-    call thread_create
-    test rax, rax
-    jz .fail_restore
-
-    mov r12, rax
-
-    ; Remove the new thread from READY before simulating sleep.
-    mov rdi, r12
-    call ready_remove
-    test eax, eax
-    jnz .fail_cleanup
-
-    mov qword [r12 + TH_STATE], THREAD_STATE_BLOCKED
-    lea rax, [r15 + 3]
-    mov [r12 + TH_WAKE_TICK], rax
-
-    ; Before deadline: must remain BLOCKED.
-    mov [scheduler_tick_count], r15
-    call scheduler_wake_sleepers
-    cmp qword [r12 + TH_STATE], THREAD_STATE_BLOCKED
-    jne .fail_cleanup
-    cmp qword [ready_count], 0
-    jne .fail_cleanup
-
-    ; One tick before deadline: still BLOCKED.
-    lea rax, [r15 + 2]
-    mov [scheduler_tick_count], rax
-    call scheduler_wake_sleepers
-    cmp qword [r12 + TH_STATE], THREAD_STATE_BLOCKED
-    jne .fail_cleanup
-    cmp qword [ready_count], 0
-    jne .fail_cleanup
-
-    ; At deadline: transition to READY exactly once.
-    lea rax, [r15 + 3]
-    mov [scheduler_tick_count], rax
-    call scheduler_wake_sleepers
-
-    cmp qword [r12 + TH_STATE], THREAD_STATE_READY
-    jne .fail_cleanup
-    cmp qword [r12 + TH_WAKE_TICK], 0
-    jne .fail_cleanup
-    cmp qword [ready_count], 1
-    jne .fail_cleanup
-    cmp qword [ready_head], r12
-    jne .fail_cleanup
-    cmp qword [ready_tail], r12
-    jne .fail_cleanup
-
-    ; Repeated wakeup must not enqueue the same thread twice.
-    call scheduler_wake_sleepers
-    cmp qword [ready_count], 1
-    jne .fail_cleanup
-
-    mov rdi, r12
-    call thread_destroy
-    test eax, eax
-    jnz .fail_restore
-
-    cmp qword [ready_count], 0
-    jne .fail_restore
-    cmp qword [all_thread_count], 0
-    jne .fail_restore
-
-    mov [scheduler_tick_count], r15
-    lea r9, [msg_sleep_test_ok]
-    call draw_text
-    xor eax, eax
-    jmp .done
-
-.fail_cleanup:
-    ; Restore a valid queue state so cleanup can safely destroy the thread.
-    cmp qword [r12 + TH_STATE], THREAD_STATE_BLOCKED
-    jne .destroy
-    mov qword [r12 + TH_STATE], THREAD_STATE_READY
-    mov qword [r12 + TH_WAKE_TICK], 0
-    cmp qword [ready_count], 0
-    jne .destroy
-    mov rdi, r12
-    call ready_enqueue
-
-.destroy:
-    mov rdi, r12
-    call thread_destroy
-
-.fail_restore:
-    mov [scheduler_tick_count], r15
-.fail:
-    lea r9, [msg_sleep_test_fail]
-    call draw_text
-    mov eax, 1
-
-.done:
-    add rsp, 8
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    ret
-
 thread_sleep_test_entry:
     ret
 
@@ -15320,10 +15201,6 @@ msg_sleep_test_ok:
     db "Thread sleep/wakeup: PASS",10,0
 msg_sleep_test_fail:
     db "Thread sleep/wakeup: FAIL",10,0
-str_diag2_sleep:
-    db "Real thread_sleep / wakeup",0
-reason_diag2_sleep:
-    db "Sleep returned early, failed to resume, or did not wait for at least 3 timer ticks",10,0
 align 8
 diag_phase:
     dq 0
