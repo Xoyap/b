@@ -88,6 +88,11 @@ global _e
 %define PAGE_SHIFT             12
 %define PAGE_SIZE              4096
 
+; Reserved lower-half range for future Ring-3 mappings.
+; PML4 slot 0 stays supervisor-only for the current identity map.
+%define USER_VADDR_BASE        0x0000008000000000
+%define USER_VADDR_LIMIT       0x0000800000000000
+
 %define EFI_SUCCESS            0
 %define EFI_BUFFER_TOO_SMALL   0x8000000000000005
 
@@ -686,6 +691,14 @@ draw_text:
     add rsp, 8
     pop r12
     ret
+
+;================ UI BACKEND BOUNDARY ==========================
+; Keep kernel startup independent from the concrete UI renderer.
+; This initial backend still runs in Ring 0 and delegates to the existing
+; renderer. It is an internal seam for future UI lifecycle/compositor work,
+; not a userspace boundary or a security/isolation mechanism.
+ui_backend_draw:
+    jmp desktop_draw
 
 ;================ DESKTOP DRAW =================
 
@@ -6782,6 +6795,27 @@ vmm_map_4k_pml4:
     mov r13, r8                 ; physical
     mov r15, r9                 ; flags
 
+    test r11, r11
+    jz .oom
+
+    ; PAGE_USER mappings are allowed only in a process-private root
+    ; and in the reserved canonical lower-half range.
+    test r15, PAGE_USER
+    jz .user_range_ok
+    cmp r11, [pml4_ptr]
+    je .conflict
+    mov rax, USER_VADDR_BASE
+    cmp r12, rax
+    jb .conflict
+    mov rax, USER_VADDR_LIMIT
+    cmp r12, rax
+    jae .conflict
+    test r12, PAGE_SIZE - 1
+    jnz .conflict
+    test r13, PAGE_SIZE - 1
+    jnz .conflict
+.user_range_ok:
+
     mov rbx, r11
 
     mov rax, r12
@@ -6800,6 +6834,10 @@ vmm_map_4k_pml4:
     or rax, PAGE_PRESENT | PAGE_WRITABLE
     mov [rbx + r14*8], rax
 .pdpt:
+    test r15, PAGE_USER
+    jz .pdpt_user_ready
+    or qword [rbx + r14*8], PAGE_USER
+.pdpt_user_ready:
     mov rax, [rbx + r14*8]
     test al, PAGE_SIZE_FLAG
     jnz .conflict
@@ -6823,6 +6861,10 @@ vmm_map_4k_pml4:
     or rax, PAGE_PRESENT | PAGE_WRITABLE
     mov [rbx + r14*8], rax
 .pd:
+    test r15, PAGE_USER
+    jz .pd_user_ready
+    or qword [rbx + r14*8], PAGE_USER
+.pd_user_ready:
     mov rax, [rbx + r14*8]
     test al, PAGE_SIZE_FLAG
     jnz .conflict
@@ -6846,6 +6888,10 @@ vmm_map_4k_pml4:
     or rax, PAGE_PRESENT | PAGE_WRITABLE
     mov [rbx + r14*8], rax
 .pt:
+    test r15, PAGE_USER
+    jz .pt_user_ready
+    or qword [rbx + r14*8], PAGE_USER
+.pt_user_ready:
     mov rax, [rbx + r14*8]
     test al, PAGE_SIZE_FLAG
     jnz .split_needed
@@ -8174,10 +8220,6 @@ kernel_diagnostic:
     lea rdx, [reason_diag2_scheduler]
     call diag_run_one
 
-    lea rdi, [str_diag2_sleep]
-    lea rsi, [thread_sleep_test]
-    lea rdx, [reason_diag2_sleep]
-    call diag_run_one
     
     ; Keep IF=0 during preemptive-scheduler setup.  thread_bootstrap enables
     ; interrupts only after scheduler_start has saved the shell context.
@@ -12891,7 +12933,7 @@ kernel_entry:
     lea rsi, [s_kern_console]
     call serial_puts
     call console_clear
-    call desktop_draw
+    call ui_backend_draw
 
     jmp .kernel_console_ready
 
