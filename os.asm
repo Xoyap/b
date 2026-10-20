@@ -687,6 +687,14 @@ draw_text:
     pop r12
     ret
 
+;================ UI BACKEND BOUNDARY ==========================
+; Keep kernel startup independent from the concrete UI renderer.
+; This initial backend still runs in Ring 0 and delegates to the existing
+; renderer. It is an internal seam for future UI lifecycle/compositor work,
+; not a userspace boundary or a security/isolation mechanism.
+ui_backend_draw:
+    jmp desktop_draw
+
 ;================ DESKTOP DRAW =================
 
 desktop_draw:
@@ -12891,7 +12899,7 @@ kernel_entry:
     lea rsi, [s_kern_console]
     call serial_puts
     call console_clear
-    call desktop_draw
+    call ui_backend_draw
 
     jmp .kernel_console_ready
 
