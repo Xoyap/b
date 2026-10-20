@@ -911,10 +911,90 @@ fill_rect_bg:
     call fill_rect
     ret
 
-; Cursor overlay: XOR the cursor into the framebuffer.
-; Drawing and erasing use the exact same XOR operation, so erasing
-; restores every pixel exactly without saving/restoring framebuffer data.
-; This avoids corrupting characters when the cursor blinks.
+;================ KERNEL LOGO =================
+; Draw the boot logo after the kernel UI is ready.
+; Each '#' in the bitmap occupies a 4x7 pixel rectangle.
+
+draw_kernel_logo:
+    push rbx
+    push rsi
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+
+    ; Center a 112-column logo on the framebuffer.
+    mov rax, [video + Video.w]
+    cmp rax, 560
+    jb .left_edge
+
+    sub rax, 560
+    shr rax, 1
+    jmp .x_ready
+
+.left_edge:
+    xor eax, eax
+
+.x_ready:
+    mov rbx, rax
+    lea r12, [kernel_logo_rows]
+    xor r14d, r14d
+    mov r13d, 64
+
+.row:
+    mov r15, [r12 + r14*8]
+    mov rsi, rbx
+
+.col:
+    mov al, [r15]
+    test al, al
+    jz .next_row
+
+    cmp al, '#'
+    jne .next_char
+
+    mov rcx, rsi
+    mov rdx, r13
+    mov r8d, 4
+    mov r9d, 7
+    mov r10d, UI_ACCENT
+    call fill_rect
+
+.next_char:
+    inc r15
+    add rsi, 5
+    jmp .col
+
+.next_row:
+    add r13, 9
+    inc r14
+    cmp r14, 17
+    jb .row
+
+    ; Continue the kernel startup text below the logo.
+    mov rax, [margin_x]
+    mov [video + Video.cx], rax
+
+    lea rax, [r13 + 12]
+    cmp rax, [video + Video.h]
+    jb .set_y
+
+    mov rax, [video + Video.h]
+    sub rax, CHAR_H
+
+.set_y:
+    mov [video + Video.cy], rax
+
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rsi
+    pop rbx
+    ret
+
 cursor_xor_rect:
     push rbx
     push rsi
@@ -10952,7 +11032,137 @@ process_create:
     pop r12
     pop rbx
     ret
+; Free private user mappings and their page-table hierarchy.
+; Supports 4 KiB user pages only.
+; RCX = physical address of the process PML4.
+process_free_user_space:
+    push rbx
+    push rbp
+    push rsi
+    push rdi
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 40
 
+    mov r12, rcx
+    test r12, r12
+    jz .fail
+
+    ; Never free the active kernel page-table root.
+    cmp r12, [pml4_ptr]
+    je .fail
+
+    ; PML4[1..255] is reserved for private user mappings.
+    mov r13, 1
+
+.pml4_loop:
+    cmp r13, 256
+    jae .ok
+
+    mov rax, [r12 + r13*8]
+    test al, PAGE_PRESENT
+    jz .next_pml4
+
+    MASK_FRAME rax
+    mov r14, rax
+    xor r15d, r15d
+
+.pdpt_loop:
+    cmp r15, 512
+    jae .free_pdpt
+
+    mov rax, [r14 + r15*8]
+    test al, PAGE_PRESENT
+    jz .next_pdpt
+
+    ; User 1 GiB pages are not supported yet.
+    test al, PAGE_SIZE_FLAG
+    jnz .fail
+
+    MASK_FRAME rax
+    mov rbx, rax
+    xor ebp, ebp
+
+.pd_loop:
+    cmp rbp, 512
+    jae .free_pd
+
+    mov rax, [rbx + rbp*8]
+    test al, PAGE_PRESENT
+    jz .next_pd
+
+    ; User 2 MiB pages are not supported yet.
+    test al, PAGE_SIZE_FLAG
+    jnz .fail
+
+    MASK_FRAME rax
+    mov rsi, rax
+    xor edi, edi
+
+.pt_loop:
+    cmp rdi, 512
+    jae .free_pt
+
+    mov rax, [rsi + rdi*8]
+    test al, PAGE_PRESENT
+    jz .next_pt
+
+    mov qword [rsi + rdi*8], 0
+    MASK_FRAME rax
+    mov rcx, rax
+    call pmm_free_page
+
+.next_pt:
+    inc rdi
+    jmp .pt_loop
+
+.free_pt:
+    mov qword [rbx + rbp*8], 0
+    mov rcx, rsi
+    call pmm_free_page
+
+.next_pd:
+    inc rbp
+    jmp .pd_loop
+
+.free_pd:
+    mov qword [r14 + r15*8], 0
+    mov rcx, rbx
+    call pmm_free_page
+
+.next_pdpt:
+    inc r15
+    jmp .pdpt_loop
+
+.free_pdpt:
+    mov qword [r12 + r13*8], 0
+    mov rcx, r14
+    call pmm_free_page
+
+.next_pml4:
+    inc r13
+    jmp .pml4_loop
+
+.ok:
+    xor eax, eax
+    jmp .done
+
+.fail:
+    mov eax, 1
+
+.done:
+    add rsp, 40
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rbp
+    pop rbx
+    ret
 ; int process_destroy(Process *p)
 process_destroy:
     push r12
@@ -10971,6 +11181,15 @@ process_destroy:
     jne .fail
     cmp qword [current_process], r12
     je .fail
+
+    mov r13, [r12 + PR_PML4]
+    test r13, r13
+    jz .fail
+
+    mov rcx, r13
+    call process_free_user_space
+    test eax, eax
+    jnz .fail
 
     mov rdi, r12
     call process_list_remove
@@ -12993,6 +13212,7 @@ kernel_entry:
     call serial_puts
     call console_clear
     call ui_backend_draw
+    call draw_kernel_logo
 
     jmp .kernel_console_ready
 
@@ -13705,7 +13925,52 @@ ui_title:    db "0xDEAD OS", 0
 ui_status:   db "NATIVE KERNEL  |  x86-64", 0
 ui_terminal: db "KERNEL CONSOLE", 0
 ui_footer:   db "UEFI -> NATIVE KERNEL", 0
+align 8
+kernel_logo_rows:
+    dq kernel_logo_r01, kernel_logo_r02
+    dq kernel_logo_r03, kernel_logo_r04
+    dq kernel_logo_r05, kernel_logo_r06
+    dq kernel_logo_r07, kernel_logo_r08
+    dq kernel_logo_r09, kernel_logo_r10
+    dq kernel_logo_r11, kernel_logo_r12
+    dq kernel_logo_r13, kernel_logo_r14
+    dq kernel_logo_r15, kernel_logo_r16
+    dq kernel_logo_r17
 
+kernel_logo_r01:
+    db "################# ######    ######  #############     ##################  #################  #############",0
+kernel_logo_r02:
+    db " ################  ######    ######  #################  ################   ################   ################",0
+kernel_logo_r03:
+    db " ################  ######    ######  #################  ################   ################   ################",0
+kernel_logo_r04:
+    db " ######    ######  ######    ######  ######     ######   #######  ######   ######    ######   ######    ######",0
+kernel_logo_r05:
+    db " ######    ######  ######    ######  ######     ######   #######  ######   ######    ######   ######    ######",0
+kernel_logo_r06:
+    db " ######    ######  ########  ######  ######     ######    ####### ##       ######    ######   ######    ######",0
+kernel_logo_r07:
+    db " ######    ######  ################  ######     ######    #######          ######    ######   ######    ######",0
+kernel_logo_r08:
+    db " ######    ######     ###########    ######     ###### ###########        ######    ######   ######    ######",0
+kernel_logo_r09:
+    db " ######    ######  ################  ######     ###### ###########         ######    ######   ######    ######",0
+kernel_logo_r10:
+    db " ######    ######  ######    ######  ######     ###### #######       ###   ######    ######   ######    ######",0
+kernel_logo_r11:
+    db " ######    ######  ######    ######  ######     ###### #######    ######   ################   ######    ######",0
+kernel_logo_r12:
+    db " ######    ######  ######    ######  ######     ###### #######    ######  #################   ######    ######",0
+kernel_logo_r13:
+    db " ######    ######  ######    ######  ######     ###### #######    ######   ######    ######   ######    ######",0
+kernel_logo_r14:
+    db " ######    ######  ######    ######  ######     ###### #######    ######   ######    ######   ######    ######",0
+kernel_logo_r15:
+    db " #######  #######  ######    ######  ########  ####### #######  #######   ######    ######   #######  #######",0
+kernel_logo_r16:
+    db "#################  ######    ######  ################# ###################  #######   #######  #################",0
+kernel_logo_r17:
+    db "    ##########       ####       ###      #########         ##########        ####      ####      ##########",0
 align 16
 guid:
     dd 0x9042a9de
