@@ -3896,6 +3896,38 @@ tss_init:
     pop rbx
     ret
 
+; Update the privilege-transition stack for the active thread.
+tss_update_rsp0:
+    push rax
+    push rdx
+
+    mov rax, [current_thread]
+    test rax, rax
+    jz .kernel_stack
+
+    mov rdx, THREAD_MAGIC
+    cmp qword [rax + TH_MAGIC], rdx
+    jne .kernel_stack
+
+    test qword [rax + TH_FLAGS], THREAD_FLAG_STATIC
+    jnz .kernel_stack
+
+    mov rax, [rax + TH_STACK_TOP]
+    test rax, rax
+    jz .kernel_stack
+
+    mov [tss + 4], rax
+    jmp .done
+
+.kernel_stack:
+    lea rax, [kernel_stack_top]
+    mov [tss + 4], rax
+
+.done:
+    pop rdx
+    pop rax
+    ret
+
 idt_init_full:
     push rbx
     push r12
@@ -8220,7 +8252,11 @@ kernel_diagnostic:
     lea rdx, [reason_diag2_scheduler]
     call diag_run_one
 
-    
+    lea rdi, [str_diag2_sleep]
+    lea rsi, [thread_sleep_test]
+    lea rdx, [reason_diag2_sleep]
+    call diag_run_one
+
     ; Keep IF=0 during preemptive-scheduler setup.  thread_bootstrap enables
     ; interrupts only after scheduler_start has saved the shell context.
     lea rdi, [str_diag2_preempt]
@@ -9675,7 +9711,8 @@ context_switch:
     mov [rdi + CTX_RFLAGS], rax
 
     cli
-
+    call tss_update_rsp0
+    
     mov [rdi + CTX_RSP], rsp
     mov [rdi + CTX_RBX], rbx
     mov [rdi + CTX_RBP], rbp
@@ -10312,6 +10349,7 @@ scheduler_timer_tick:
 
     mov qword [r13 + TH_STATE], THREAD_STATE_RUNNING
     mov [current_thread], r13
+    call tss_update_rsp0
     mov qword [r13 + TH_SLICE_TICKS], 0
     inc qword [scheduler_context_switches]
     inc qword [scheduler_preemptions]
@@ -10863,6 +10901,14 @@ process_create:
     mov rdi, rbx
     mov ecx, 512
     rep movsq
+
+    ; Keep the kernel identity-map slot.
+    ; Reserve PML4 slots 1..255 for private user mappings.
+    lea rdi, [rbx + 8]
+    xor eax, eax
+    mov ecx, 255
+    rep stosq
+
     or qword [r12 + PR_FLAGS], PROCESS_FLAG_ASPACE_READY
     jmp .root_ready
 
@@ -11432,6 +11478,19 @@ process_model_test:
     ; Attach a real kernel thread to process A and verify ownership metadata.
     lea rdi, [thread_test_entry]
     xor esi, esi
+    mov rcx, [r12 + PR_PML4]
+    call phys_to_virt
+    test rax, rax
+    jz .cleanup_a
+
+    cmp qword [rax + 8], 0
+    jne .cleanup_a
+
+    cmp qword [rax + 127*8], 0
+    jne .cleanup_a
+
+    cmp qword [rax + 255*8], 0
+    jne .cleanup_a
     call thread_create
     test rax, rax
     jz .cleanup_b
