@@ -7021,11 +7021,14 @@ vmm_map_4k_pml4:
     shr rax, 12
     and eax, PT_INDEX_BITS
     mov r14, rax
+    test qword [rbx + r14*8], PAGE_PRESENT
+    jnz .conflict
     mov rax, r13
     and rax, -PAGE_SIZE
     or rax, r15
     or rax, PAGE_PRESENT
     mov [rbx + r14*8], rax
+
     invlpg [r12]
     xor eax, eax
     jmp .done
@@ -10898,6 +10901,157 @@ kernel_process_init:
 .fail:
     mov eax, 1
     ret
+; int process_map_user_page(Process *p, u64 va, u64 pa, u64 flags)
+; RCX = Process*, RDX = user VA, R8 = physical page, R9 = flags
+process_map_user_page:
+    push r12
+    mov r12, rcx
+
+    test r12, r12
+    jz .fail
+    cmp qword [r12 + PR_MAGIC], PROCESS_MAGIC
+    jne .fail
+
+    test qword [r12 + PR_FLAGS], PROCESS_FLAG_KERNEL
+    jnz .fail
+    test qword [r12 + PR_FLAGS], PROCESS_FLAG_ASPACE_READY
+    jz .fail
+
+    cmp qword [r12 + PR_PML4], 0
+    je .fail
+    test r9, PAGE_USER
+    jz .fail
+
+    mov rcx, [r12 + PR_PML4]
+    call vmm_map_4k_pml4
+
+    pop r12
+    ret
+
+.fail:
+    mov eax, 1
+    pop r12
+    ret
+
+
+; int process_unmap_user_page(Process *p, uint64_t va)
+; RCX = process, RDX = virtual address
+; EAX = 0 on success, 1 on failure
+; The physical frame remains owned by the caller.
+
+process_unmap_user_page:
+    push rbx
+    push r12
+    push r13
+    push r14
+
+    mov r12, rcx
+    mov r13, rdx
+
+    test r12, r12
+    jz .fail
+    cmp qword [r12 + PR_MAGIC], PROCESS_MAGIC
+    jne .fail
+
+    test qword [r12 + PR_FLAGS], PROCESS_FLAG_KERNEL
+    jnz .fail
+    test qword [r12 + PR_FLAGS], PROCESS_FLAG_ASPACE_READY
+    jz .fail
+
+    cmp qword [r12 + PR_PML4], 0
+    je .fail
+
+    ; Only aligned addresses in the reserved user range.
+    test r13, PAGE_SIZE - 1
+    jnz .fail
+
+    mov rax, USER_VADDR_BASE
+    cmp r13, rax
+    jb .fail
+
+    mov rax, USER_VADDR_LIMIT
+    cmp r13, rax
+    jae .fail
+
+    ; Walk this process's private page tables.
+    mov rbx, [r12 + PR_PML4]
+
+    mov rax, r13
+    shr rax, 39
+    and eax, PT_INDEX_BITS
+    mov r14, rax
+
+    mov rax, [rbx + r14*8]
+    test al, PAGE_PRESENT
+    jz .fail
+    test al, PAGE_USER
+    jz .fail
+    MASK_FRAME rax
+    mov rbx, rax
+
+    mov rax, r13
+    shr rax, 30
+    and eax, PT_INDEX_BITS
+    mov r14, rax
+
+    mov rax, [rbx + r14*8]
+    test al, PAGE_PRESENT
+    jz .fail
+    test al, PAGE_SIZE_FLAG
+    jnz .fail
+    test al, PAGE_USER
+    jz .fail
+    MASK_FRAME rax
+    mov rbx, rax
+
+    mov rax, r13
+    shr rax, 21
+    and eax, PT_INDEX_BITS
+    mov r14, rax
+
+    mov rax, [rbx + r14*8]
+    test al, PAGE_PRESENT
+    jz .fail
+    test al, PAGE_SIZE_FLAG
+    jnz .fail
+    test al, PAGE_USER
+    jz .fail
+    MASK_FRAME rax
+    mov rbx, rax
+
+    mov rax, r13
+    shr rax, 12
+    and eax, PT_INDEX_BITS
+    mov r14, rax
+
+    mov rax, [rbx + r14*8]
+    test al, PAGE_PRESENT
+    jz .fail
+    test al, PAGE_USER
+    jz .fail
+
+    ; Remove only the PTE. Do not free its physical frame.
+    mov qword [rbx + r14*8], 0
+
+    ; Invalidate locally only if this process's root is active.
+    mov rax, [r12 + PR_PML4]
+    cmp rax, [pml4_ptr]
+    jne .ok
+    invlpg [r13]
+
+.ok:
+    xor eax, eax
+    jmp .done
+
+.fail:
+    mov eax, 1
+
+.done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
 
 ; Process *process_create(void)
 process_create:
@@ -11077,9 +11231,10 @@ process_free_user_space:
     test al, PAGE_PRESENT
     jz .next_pdpt
 
-    ; User 1 GiB pages are not supported yet.
+    ; A 1 GiB leaf is not a child page table.
+    ; Skip it; never free the mapped physical region as a table.
     test al, PAGE_SIZE_FLAG
-    jnz .fail
+    jnz .next_pdpt
 
     MASK_FRAME rax
     mov rbx, rax
@@ -11093,9 +11248,10 @@ process_free_user_space:
     test al, PAGE_PRESENT
     jz .next_pd
 
-    ; User 2 MiB pages are not supported yet.
+    ; A 2 MiB leaf is not a child page table.
+    ; Skip it; never free the mapped physical region as a table.
     test al, PAGE_SIZE_FLAG
-    jnz .fail
+    jnz .next_pd
 
     MASK_FRAME rax
     mov rsi, rax
@@ -11651,11 +11807,19 @@ preempt_test_worker:
     ret
 
 process_model_test:
+    push rbx
     push r12
     push r13
     push r14
     push r15
-    sub rsp, 8
+    sub rsp, 16
+
+    ; Explicitly initialize every cleanup handle.
+    xor r12d, r12d                ; Process A
+    xor r13d, r13d                ; Process B
+    xor r14d, r14d                ; test thread
+    xor r15d, r15d                ; allocated data page (if any)
+    xor ebx, ebx                  ; 1 only after the page is successfully mapped
 
     call scheduler_disable_preemption
     call kernel_process_init
@@ -11675,6 +11839,19 @@ process_model_test:
     test qword [r12 + PR_FLAGS], PROCESS_FLAG_ASPACE_READY
     jz .cleanup_a
 
+    ; Check the reserved user PML4 slots while they are still empty.
+    ; These assertions must run BEFORE the first user mapping is installed.
+    mov rcx, [r12 + PR_PML4]
+    call phys_to_virt
+    test rax, rax
+    jz .cleanup_a
+    cmp qword [rax + 8], 0
+    jne .cleanup_a
+    cmp qword [rax + 127*8], 0
+    jne .cleanup_a
+    cmp qword [rax + 255*8], 0
+    jne .cleanup_a
+
     call process_create
     test rax, rax
     jz .cleanup_a
@@ -11693,23 +11870,119 @@ process_model_test:
     mov rax, [r12 + PR_PID]
     cmp rax, [r13 + PR_PID]
     je .cleanup_b
+    ; Allocate a physical page for Process A.
+    call pmm_alloc_page
+    test rax, rax
+    jz .cleanup_b
+    mov r15, rax
+
+    ; Map it at the first reserved user virtual address.
+    mov rcx, r12
+    mov rdx, USER_VADDR_BASE
+    mov r8, r15
+    mov r9, PAGE_USER | PAGE_WRITABLE
+    call process_map_user_page
+    test eax, eax
+    jnz .cleanup_b
+    mov ebx, 1                    ; Process A now owns the mapped data page
+
+    ; Mapping the same VA twice must fail.
+    mov rcx, r12
+    mov rdx, USER_VADDR_BASE
+    mov r8, r15
+    mov r9, PAGE_USER | PAGE_WRITABLE
+    call process_map_user_page
+    test eax, eax
+    jz .cleanup_b
+
+    ; Verify PML4[1]: present, writable, user-accessible.
+    mov rax, [r12 + PR_PML4]
+    mov rax, [rax + 8]
+    mov rdx, rax
+    and rdx, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
+    cmp rdx, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
+    jne .cleanup_b
+
+    ; Verify PDPT[0].
+    MASK_FRAME rax
+    mov rax, [rax]
+    mov rdx, rax
+    and rdx, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
+    cmp rdx, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
+    jne .cleanup_b
+
+    ; Verify PD[0].
+    MASK_FRAME rax
+    mov rax, [rax]
+    mov rdx, rax
+    and rdx, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
+    cmp rdx, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
+    jne .cleanup_b
+
+    ; Verify PT[0] and the physical page frame.
+    MASK_FRAME rax
+    mov rax, [rax]
+    mov rdx, rax
+    and rdx, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
+    cmp rdx, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
+    jne .cleanup_b
+
+    MASK_FRAME rax
+    cmp rax, r15
+    jne .cleanup_b
+
+    ; TEST: unmap the existing user mapping.
+    mov rcx, r12
+    mov rdx, USER_VADDR_BASE
+    call process_unmap_user_page
+    test eax, eax
+    jnz .cleanup_b
+
+    ; The PTE is gone; the old physical frame is now caller-owned.
+    xor ebx, ebx
+    mov rcx, r15
+    call pmm_free_page
+    xor r15d, r15d
+
+    ; TEST: unmapping the same VA again must fail.
+    mov rcx, r12
+    mov rdx, USER_VADDR_BASE
+    call process_unmap_user_page
+    test eax, eax
+    jz .cleanup_b
+
+    ; Allocate a fresh frame and remap the same virtual address.
+    call pmm_alloc_page
+    test rax, rax
+    jz .cleanup_b
+    mov r15, rax
+
+    mov rcx, r12
+    mov rdx, USER_VADDR_BASE
+    mov r8, r15
+    mov r9, PAGE_USER | PAGE_WRITABLE
+    call process_map_user_page
+    test eax, eax
+    jnz .cleanup_b
+    mov ebx, 1
+
+    ; TEST: the remapped PTE must point to the new frame.
+    mov rax, [r12 + PR_PML4]
+    mov rax, [rax + 8]
+    MASK_FRAME rax
+    mov rax, [rax]
+    MASK_FRAME rax
+    mov rax, [rax]
+    MASK_FRAME rax
+    mov rax, [rax]
+    MASK_FRAME rax
+    cmp rax, r15
+    jne .cleanup_b
+
 
     ; Attach a real kernel thread to process A and verify ownership metadata.
     lea rdi, [thread_test_entry]
     xor esi, esi
-    mov rcx, [r12 + PR_PML4]
-    call phys_to_virt
-    test rax, rax
-    jz .cleanup_a
-
-    cmp qword [rax + 8], 0
-    jne .cleanup_a
-
-    cmp qword [rax + 127*8], 0
-    jne .cleanup_a
-
-    cmp qword [rax + 255*8], 0
-    jne .cleanup_a
     call thread_create
     test rax, rax
     jz .cleanup_b
@@ -11751,17 +12024,18 @@ process_model_test:
     mov rdi, r13
     call process_destroy
     test eax, eax
-    jnz .fail
+    jnz .cleanup_b
     xor r13d, r13d
 
     lea r9, [msg_processtest_ok]
     call draw_text
     xor eax, eax
-    add rsp, 8
+    add rsp, 16
     pop r15
     pop r14
     pop r13
     pop r12
+    pop rbx
     ret
 
 .cleanup_attached:
@@ -11769,27 +12043,55 @@ process_model_test:
     mov rsi, r14
     call process_detach_thread
 .cleanup_thread:
+    test r14, r14
+    jz .cleanup_b
+    mov rdi, r14
+    call thread_destroy
+    test eax, eax
+    jnz .cleanup_b
+    xor r14d, r14d
+    jmp .cleanup_b
+.cleanup_b:
+    ; Retry destruction if a previous thread_destroy call returned an error.
+    test r14, r14
+    jz .cleanup_page
     mov rdi, r14
     call thread_destroy
     xor r14d, r14d
-.cleanup_b:
+.cleanup_page:
+    ; If mapping failed, the allocated data page was never owned by a PTE.
+    ; If mapping succeeded, process_destroy(A) will release it via the PTE.
+    test r15, r15
+    jz .cleanup_process_b
+    test ebx, ebx
+    jnz .cleanup_process_b
+    mov rcx, r15
+    call pmm_free_page
+    xor r15d, r15d
+.cleanup_process_b:
+    test r13, r13
+    jz .cleanup_a
     mov rdi, r13
     call process_destroy
     xor r13d, r13d
 .cleanup_a:
+    test r12, r12
+    jz .fail
     mov rdi, r12
     call process_destroy
     xor r12d, r12d
+    jmp .fail
 .fail:
     call scheduler_disable_preemption
     lea r9, [msg_processtest_fail]
     call draw_text
     mov eax, 1
-    add rsp, 8
+    add rsp, 16
     pop r15
     pop r14
     pop r13
     pop r12
+    pop rbx
     ret
 
 ;---------------- Scheduler test ----------------
@@ -13952,7 +14254,7 @@ kernel_logo_r06:
 kernel_logo_r07:
     db " ######    ######  ################  ######     ######    #######          ######    ######   ######    ######",0
 kernel_logo_r08:
-    db " ######    ######     ###########    ######     ###### ###########        ######    ######   ######    ######",0
+    db " ######    ######     ###########    ######     ###### ###########         ######    ######   ######    ######",0
 kernel_logo_r09:
     db " ######    ######  ################  ######     ###### ###########         ######    ######   ######    ######",0
 kernel_logo_r10:
@@ -13968,9 +14270,9 @@ kernel_logo_r14:
 kernel_logo_r15:
     db " #######  #######  ######    ######  ########  ####### #######  #######   ######    ######   #######  #######",0
 kernel_logo_r16:
-    db "#################  ######    ######  ################# ###################  #######   #######  #################",0
+    db "#################  ######    ######  ################# ###################  #######   #######  ############",0
 kernel_logo_r17:
-    db "    ##########       ####       ###      #########         ##########        ####      ####      ##########",0
+    db "    ##########       ####       ###      #########         ##########        ####      ####      #######",0
 align 16
 guid:
     dd 0x9042a9de
